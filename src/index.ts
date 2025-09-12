@@ -148,8 +148,16 @@ class OriginLauncher implements types.IGameStore {
     return Promise.reject(new MissingXMLElementError('gameTitle(en_US)'));
   }
 
+  private getDataPath(): string {
+    if (process.platform === 'win32') {
+      return ORIGIN_DATAPATH;
+    } else {
+      return undefined;
+    }
+  }
+
   private parseLocalContent(): Promise<types.IGameStoreEntry[]> {
-    const localData = path.join(ORIGIN_DATAPATH, 'LocalContent');
+    const localData = path.join(this.getDataPath(), 'LocalContent');
     const allEntries: IEntry[] = [];
     return turbowalk(localData, entries => {
       allEntries.push(...entries);
@@ -224,8 +232,11 @@ class OriginLauncher implements types.IGameStore {
 }
 
 function main(context: types.IExtensionContext) {
-  const instance: types.IGameStore =
-    process.platform === 'win32' ? new OriginLauncher() : undefined;
+  // Only register on Windows where Origin is supported
+  if (process.platform !== 'win32') {
+    return false;
+  }
+  const instance: types.IGameStore = new OriginLauncher();
 
   if (instance !== undefined) {
     context.registerGameStore(instance);
