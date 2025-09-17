@@ -49,8 +49,8 @@ class OriginLauncher implements types.IGameStore {
     if (process.platform === 'win32') {
       try {
         const clientPath = winapi.RegGetValue('HKEY_LOCAL_MACHINE',
-          'SOFTWARE\\WOW6432Node\\Origin',
-          'ClientPath');
+                                              'SOFTWARE\\WOW6432Node\\Origin',
+                                              'ClientPath');
         this.mClientPath = Promise.resolve(clientPath.value as string);
       } catch (err) {
         log('info', 'Origin launcher not found', { error: err.message });
@@ -93,7 +93,7 @@ class OriginLauncher implements types.IGameStore {
       .then(entries => entries.find(matcher))
       .then(entry => entry === undefined
         ? Promise.reject(new types.GameEntryNotFound(Array.isArray(appId)
-            ? appId.join(', ') : appId, STORE_ID))
+          ? appId.join(', ') : appId, STORE_ID))
         : Promise.resolve(entry));
   }
 
@@ -192,7 +192,7 @@ class OriginLauncher implements types.IGameStore {
                 //  to ensure that the installer data file exists before we do anything.
                 return fs.statAsync(installerFilepath).then(() =>
                   Bluebird.any([this.getGameName(installerFilepath, 'DiPManifest'),
-                                this.getGameName(installerFilepath, 'default')]))
+                    this.getGameName(installerFilepath, 'default')]))
                   .then(name => {
                     // We found the name.
                     const launcherEntry: types.IGameStoreEntry = {
