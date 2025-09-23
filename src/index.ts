@@ -1,6 +1,6 @@
 import * as Bluebird from 'bluebird';
 import * as path from 'path';
-import * as winapi from 'winapi-bindings';
+import * as fs from 'fs-extra';
 
 import { parseStringPromise } from 'xml2js';
 
@@ -8,7 +8,7 @@ import * as queryParser from 'querystring';
 
 import turbowalk, { IEntry } from 'turbowalk';
 
-import { fs, log, types, util } from 'vortex-api';
+import { log, types, util } from 'vortex-api';
 
 const STORE_ID = 'origin';
 const STORE_NAME = 'Origin';
@@ -17,6 +17,7 @@ const MANIFEST_EXT = '.mfst';
 
 const INSTALLER_DATA = path.join('__Installer', 'installerdata.xml');
 const ORIGIN_DATAPATH = 'c:\\ProgramData\\Origin\\';
+const ORIGIN_MAC_DATAPATH = 'Library/Application Support/Origin';
 
 export class MissingXMLElementError extends Error {
   private mElementName: string;
@@ -47,18 +48,53 @@ class OriginLauncher implements types.IGameStore {
 
   constructor() {
     if (process.platform === 'win32') {
-      try {
-        const clientPath = winapi.RegGetValue('HKEY_LOCAL_MACHINE',
-          'SOFTWARE\\WOW6432Node\\Origin',
-          'ClientPath');
-        this.mClientPath = Promise.resolve(clientPath.value as string);
-      } catch (err) {
+      // Windows implementation
+      import('winapi-bindings').then((winapi) => {
+        try {
+          const clientPath = winapi.RegGetValue('HKEY_LOCAL_MACHINE',
+            'SOFTWARE\\WOW6432Node\\Origin',
+            'ClientPath');
+          this.mClientPath = Promise.resolve(clientPath.value as string);
+        } catch (err) {
+          log('info', 'Origin launcher not found', { error: err.message });
+          this.mClientPath = Promise.resolve(undefined);
+        }
+      }).catch((err) => {
         log('info', 'Origin launcher not found', { error: err.message });
         this.mClientPath = Promise.resolve(undefined);
-      }
+      });
+    } else if (process.platform === 'darwin') {
+      // macOS implementation
+      this.mClientPath = this.findMacOSOriginPath();
     } else {
       this.mClientPath = Promise.resolve(undefined);
     }
+  }
+
+  /**
+   * Find Origin/EA App on macOS
+   */
+  private async findMacOSOriginPath(): Promise<string> {
+    // Check standard installation paths
+    const possiblePaths = [
+      '/Applications/Origin.app',
+      '/Applications/EADesktop.app',
+      path.join(process.env.HOME || '', 'Applications', 'Origin.app'),
+      path.join(process.env.HOME || '', 'Applications', 'EADesktop.app')
+    ];
+
+    for (const appPath of possiblePaths) {
+      try {
+        const stat = await fs.stat(appPath);
+        if (stat.isDirectory()) {
+          return Promise.resolve(appPath);
+        }
+      } catch (err) {
+        // Continue to next path
+      }
+    }
+
+    return Promise.reject(new Error('Origin/EA App not found on macOS'));
   }
 
   public launchGame(appId: string): Promise<void> {
@@ -127,7 +163,7 @@ class OriginLauncher implements types.IGameStore {
   }
 
   private async getGameName(installerPath: string, manifestType: ManifestType): Promise<string> {
-    const installerData = await fs.readFileBOM(installerPath, 'utf8')
+    const installerData = await fs.readFile(installerPath, 'utf8')
     let xmlDoc;
     try {
       xmlDoc = await parseStringPromise(installerData);
@@ -149,6 +185,14 @@ class OriginLauncher implements types.IGameStore {
   }
 
   private parseLocalContent(): Promise<types.IGameStoreEntry[]> {
+    if (process.platform === 'darwin') {
+      return this.parseLocalContentMacOS();
+    } else {
+      return this.parseLocalContentWindows();
+    }
+  }
+
+  private parseLocalContentWindows(): Promise<types.IGameStoreEntry[]> {
     const localData = path.join(ORIGIN_DATAPATH, 'LocalContent');
     const allEntries: IEntry[] = [];
     return turbowalk(localData, entries => {
@@ -162,7 +206,7 @@ class OriginLauncher implements types.IGameStore {
           path.extname(manifest.filePath) === MANIFEST_EXT);
 
         return Bluebird.reduce(manifests, (accum: types.IGameStoreEntry[], manifest: IEntry) =>
-          fs.readFileAsync(manifest.filePath, { encoding: 'utf-8' })
+          fs.readFile(manifest.filePath, { encoding: 'utf-8' })
             .then(data => {
               let query;
               try {
@@ -182,7 +226,7 @@ class OriginLauncher implements types.IGameStore {
 
                 // Uninstalling Origin games does NOT remove manifest files, we need
                 //  to ensure that the installer data file exists before we do anything.
-                return fs.statAsync(installerFilepath).then(() =>
+                return fs.stat(installerFilepath).then(() =>
                   Bluebird.any([this.getGameName(installerFilepath, 'DiPManifest'),
                                 this.getGameName(installerFilepath, 'default')]))
                   .then(name => {
@@ -206,30 +250,148 @@ class OriginLauncher implements types.IGameStore {
                       ? err.map(errInst => errInst.message).join(';')
                       : err;
 
-                    log('error', `failed to find game name for ${appid}`, meta);
+                    log('warn', 'failed to parse game name from manifest', meta);
                     return accum;
                   });
+              } else {
+                return Promise.resolve(accum);
               }
-              return accum;
+            })
+            .catch(err => {
+              log('warn', 'failed to parse manifest', err);
+              return Promise.resolve(accum);
             }), []);
       })
       .catch(err => {
-        // ENOENT probably just means origin is not installed
-        if (!['ENOTFOUND', 'ENOENT'].includes(err.code)) {
-          log('error', 'failed to read origin directory', { error: err.message, code: err.code });
-        }
-        return [];
+        log('warn', 'failed to read local content', err);
+        return Promise.resolve([]);
       });
+  }
+
+  private async parseLocalContentMacOS(): Promise<types.IGameStoreEntry[]> {
+    try {
+      // On macOS, Origin/EA App stores data in ~/Library/Application Support/Origin
+      const homeDir = process.env.HOME || '';
+      const originDataPath = path.join(homeDir, ORIGIN_MAC_DATAPATH);
+      
+      // Check if Origin data directory exists
+      try {
+        await fs.stat(originDataPath);
+      } catch (err) {
+        // Origin data directory not found
+        return [];
+      }
+      
+      // Look for game information in LocalContent directory
+      const localContentPath = path.join(originDataPath, 'LocalContent');
+      let gameDirs: string[] = [];
+      
+      try {
+        gameDirs = await fs.readdir(localContentPath);
+      } catch (err) {
+        // LocalContent directory not found
+        return [];
+      }
+      
+      const gameEntries: types.IGameStoreEntry[] = [];
+      
+      // Process each game directory
+      for (const gameId of gameDirs) {
+        try {
+          const manifestPath = path.join(localContentPath, gameId, `*.${MANIFEST_EXT}`);
+          // Find manifest files in the game directory
+          const manifestFiles = await this.findManifestFiles(path.join(localContentPath, gameId));
+          
+          for (const manifestFile of manifestFiles) {
+            try {
+              const manifestData = await fs.readFile(manifestFile, 'utf8');
+              // Parse manifest data (similar to Windows implementation)
+              let query;
+              try {
+                // Ignore the preceding '?'
+                query = queryParser.parse(manifestData.substr(1));
+              } catch (err) {
+                continue;
+              }
+
+              if (!!query.dipinstallpath && !!query.id) {
+                const gamePath = query.dipinstallpath as string;
+                const appid = query.id as string;
+                const installerFilepath = path.join(gamePath, INSTALLER_DATA);
+
+                // Verify the game is installed
+                try {
+                  await fs.stat(installerFilepath);
+                  // Try to get the game name
+                  try {
+                    const name = await Bluebird.any([
+                      this.getGameName(installerFilepath, 'DiPManifest'),
+                      this.getGameName(installerFilepath, 'default')
+                    ]);
+                    
+                    gameEntries.push({
+                      name,
+                      appid,
+                      gamePath,
+                      gameStoreId: STORE_ID,
+                    });
+                    break; // Found valid entry, move to next game
+                  } catch (nameErr) {
+                    // If we can't get the name, use a default
+                    gameEntries.push({
+                      name: `Origin Game ${appid}`,
+                      appid,
+                      gamePath,
+                      gameStoreId: STORE_ID,
+                    });
+                    break; // Found valid entry, move to next game
+                  }
+                } catch (installErr) {
+                  // Game not installed, continue to next manifest
+                  continue;
+                }
+              }
+            } catch (err) {
+              // Failed to process manifest file
+              log('debug', 'Failed to process Origin manifest file', { manifestFile, error: err.message });
+            }
+          }
+        } catch (err) {
+          // Failed to process game directory
+          log('debug', 'Failed to process Origin game directory', { gameId, error: err.message });
+        }
+      }
+      
+      return gameEntries;
+    } catch (err) {
+      log('error', 'Failed to parse Origin local content on macOS', { error: err.message });
+      return [];
+    }
+  }
+
+  private async findManifestFiles(gameDir: string): Promise<string[]> {
+    const manifestFiles: string[] = [];
+    try {
+      const files = await fs.readdir(gameDir);
+      for (const file of files) {
+        if (path.extname(file) === MANIFEST_EXT) {
+          manifestFiles.push(path.join(gameDir, file));
+        }
+      }
+    } catch (err) {
+      // Failed to read directory
+    }
+    return manifestFiles;
   }
 }
 
 function main(context: types.IExtensionContext) {
-  const instance: types.IGameStore =
-    process.platform === 'win32' ? new OriginLauncher() : undefined;
+  const instance: types.IGameStore = new OriginLauncher();
 
   if (instance !== undefined) {
     context.registerGameStore(instance);
   }
+
   return true;
 }
 
